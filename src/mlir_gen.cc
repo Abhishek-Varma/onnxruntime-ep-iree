@@ -518,16 +518,37 @@ class MlirGenerator {
     }
 
     // Build input SSA references.
+    // Empty-name inputs represent absent optional arguments in ONNX.  We emit
+    // torch.constant.none for them so that positional semantics are preserved.
     std::ostringstream in_names;
     std::ostringstream in_types;
     bool first_input = true;
+    bool none_emitted = false;
+
+    // Helper lambda: emit torch.constant.none to represent an absent optional
+    // ONNX input, preserving positional semantics for ops like Resize.
+    auto emit_none_input = [&]() {
+      if (!none_emitted) {
+        out_ << "    %_none = torch.constant.none\n";
+        none_emitted = true;
+      }
+      if (!first_input) {
+        in_names << ", ";
+        in_types << ", ";
+      }
+      first_input = false;
+      in_names << "%_none";
+      in_types << "!torch.none";
+    };
+
     for (size_t i = 0; i < inputs.size(); ++i) {
       if (!inputs[i]) {
-        // Skip invalid inputs (optional inputs can be empty/null).
+        emit_none_input();
         continue;
       }
       std::string input_name = inputs[i].GetName();
       if (input_name.empty()) {
+        emit_none_input();
         continue;
       }
       if (!first_input) {
