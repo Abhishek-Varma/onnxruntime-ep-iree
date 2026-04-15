@@ -1,289 +1,227 @@
-"""Export (or download) SDXL component models to ONNX.
+"""Download pre-patched SDXL component ONNX models from Azure.
 
-Provides a single entry point :func:`ensure_models` that prepares all ONNX
+Provides a single entry point :func:`ensure_models` that downloads all ONNX
 models required for a given precision mode.  Individual component functions
 are also usable standalone:
 
 - :func:`export_text_encoders` — CLIP-L + OpenCLIP-bigG
-- :func:`export_unet` — fp32/fp16 from diffusers, int8 downloaded from Azure
-- :func:`export_vae` — VAE decoder from ``madebyollin/sdxl-vae-fp16-fix``
+- :func:`export_unet` — fp32/fp16/int8 (W8A8 native i8 MFMA)
+- :func:`export_vae` — VAE decoder
+
+All models are pre-exported and pre-patched (Resize, Slice, Cast fixes for
+IREE compatibility) and hosted on Azure sharkpublic.
 """
 
+import hashlib
 import logging
 import pathlib
+import time
+import urllib.error
 import urllib.request
 
 logger = logging.getLogger(__name__)
 
 MODEL_ID = "stabilityai/stable-diffusion-xl-base-1.0"
 
-_INT8_UNET_AZURE_BASE = (
-    "https://sharkpublic.blob.core.windows.net/sharkpublic" "/SDXL/ONNX/unet/int8"
-)
-_INT8_UNET_FILES = [
-    "sdxl_int8_unet_native_i8.onnx",
-    "sdxl_int8_unet_native_i8.onnx.data",
-]
+_AZURE_BASE = "https://sharkpublic.blob.core.windows.net/sharkpublic/SDXL/ONNX"
+_DOWNLOAD_TIMEOUT_S = 600
+_DOWNLOAD_RETRIES = 3
+
+# {component: {dtype: [(filename, sha256), ...]}}
+_MODEL_FILES = {
+    "text_encoder_1": {
+        "fp32": [
+            (
+                "model.onnx",
+                "89020f346c1da1220ee8a24a38f2bf560871d6abf699ed7a2eafdf543a308cca",
+            ),
+        ],
+        "fp16": [
+            (
+                "model.onnx",
+                "f3d3f10f65052f68c65e6bc9112507c5e530d5a06c378dc78e4231021cc10f21",
+            ),
+        ],
+    },
+    "text_encoder_2": {
+        "fp32": [
+            (
+                "model.onnx",
+                "5f636234384e2444eeb62bccde99ef64470535eaec3225e3e9689a5ca98cda75",
+            ),
+            (
+                "model.onnx.data",
+                "1e520ee76280ba8b917d580fe144a97682ba96dd78efa715a5668053cc142db1",
+            ),
+        ],
+        "fp16": [
+            (
+                "model.onnx",
+                "445928de35fb8a9b5dcce112623771ae1f8daccdbffc6b27e6225f67499cb3f0",
+            ),
+            (
+                "model.onnx.data",
+                "4a8b0c99f2c6dcaefca5084af84e060377a5634acda2def7353f34cfc1b610a0",
+            ),
+        ],
+    },
+    "unet": {
+        "fp32": [
+            (
+                "model.onnx",
+                "3cd9369275b663a4e7db7be30569d48b3eb0225199d8960d1c27f34525857fec",
+            ),
+            (
+                "model.onnx.data",
+                "0a05914ac0e3c8bad44715c0b2910ce8f738a3a82ad886cc6003f199cb06b5e0",
+            ),
+        ],
+        "fp16": [
+            (
+                "model.onnx",
+                "eaff30b7adf2085fcc3c89f685bd740c7848cfdab31a62b13901358298ca3b0b",
+            ),
+            (
+                "model.onnx.data",
+                "2a4bb27c03469801c54c0bce6d5582bcfe8b8d4d0d27567165aee00b1d0a97de",
+            ),
+        ],
+        "int8": [
+            (
+                "model.onnx",
+                "a1abd212eb8648b39697ed0fb8bf1cd95686a2526bc51c3ea2bd20c1187c2de0",
+            ),
+            (
+                "model.onnx.data",
+                "371065cf0a54a9c0c52df75706e587d2ca02b3da73296efcf8f8e9d456f95c1b",
+            ),
+        ],
+    },
+    "vae_decoder": {
+        "fp32": [
+            (
+                "model.onnx",
+                "47bbddefe59f93ddec8fc6d45887356fea736115677696d92365074fe5dc54aa",
+            ),
+        ],
+        "fp16": [
+            (
+                "model.onnx",
+                "117b404461158184563ba53df782b17d8a273c69752309b66e6af13f2f150466",
+            ),
+        ],
+    },
+}
 
 
 # ---------------------------------------------------------------------------
-# Text Encoders
+# Download helper
+# ---------------------------------------------------------------------------
+
+
+def _sha256(path: pathlib.Path) -> str:
+    """Compute SHA-256 hex digest of a file, reading in 8 MB chunks."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _download_file(url: str, dest: pathlib.Path, expected_sha256: str) -> None:
+    """Download a single file with retries, timeout, and hash verification.
+
+    Uses a per-read timeout so that stalled connections are detected even on
+    multi-GB files (the timeout applies to each socket read, not the total
+    transfer time).
+    """
+    chunk_size = 8 * 1024 * 1024  # 8 MB
+    for attempt in range(1, _DOWNLOAD_RETRIES + 1):
+        try:
+            resp = urllib.request.urlopen(url, timeout=_DOWNLOAD_TIMEOUT_S)
+            with open(dest, "wb") as f:
+                while True:
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+        except (urllib.error.URLError, OSError) as exc:
+            dest.unlink(missing_ok=True)
+            if attempt < _DOWNLOAD_RETRIES:
+                wait = 2**attempt
+                logger.warning(
+                    "    Attempt %d/%d failed (%s), retrying in %ds...",
+                    attempt,
+                    _DOWNLOAD_RETRIES,
+                    exc,
+                    wait,
+                )
+                time.sleep(wait)
+                continue
+            raise RuntimeError(
+                f"Failed to download {url} after {_DOWNLOAD_RETRIES} attempts"
+            ) from exc
+
+        actual = _sha256(dest)
+        if actual == expected_sha256:
+            return
+        logger.warning(
+            "    Hash mismatch (expected %s…, got %s…), attempt %d/%d",
+            expected_sha256[:12],
+            actual[:12],
+            attempt,
+            _DOWNLOAD_RETRIES,
+        )
+        dest.unlink(missing_ok=True)
+        if attempt == _DOWNLOAD_RETRIES:
+            raise RuntimeError(
+                f"Hash verification failed for {dest.name}: "
+                f"expected {expected_sha256}, got {actual}"
+            )
+
+
+def _download_component(models_dir: pathlib.Path, component: str, dtype: str) -> None:
+    """Download a single component's ONNX files from Azure if not cached."""
+    out_dir = models_dir / component / dtype
+    file_entries = _MODEL_FILES[component][dtype]
+
+    if all((out_dir / fname).exists() for fname, _ in file_entries):
+        logger.info("  %s/%s already cached", component, dtype)
+        return
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for fname, expected_hash in file_entries:
+        dest = out_dir / fname
+        if dest.exists():
+            if _sha256(dest) == expected_hash:
+                continue
+            logger.warning("  %s exists but hash mismatch, re-downloading", dest)
+            dest.unlink()
+        url = f"{_AZURE_BASE}/{component}/{dtype}/{fname}"
+        logger.info("  Downloading %s/%s/%s ...", component, dtype, fname)
+        _download_file(url, dest, expected_hash)
+        logger.info("  Saved: %s (%.1f MB)", dest, dest.stat().st_size / 1e6)
+
+
+# ---------------------------------------------------------------------------
+# Per-component entry points
 # ---------------------------------------------------------------------------
 
 
 def export_text_encoders(models_dir: pathlib.Path, dtype: str) -> None:
-    """Export both CLIP text encoders from HuggingFace.
-
-    Args:
-        models_dir: Root directory for cached models.
-        dtype: ``"fp32"`` or ``"fp16"``.
-    """
-    import torch
-    from transformers import CLIPTextModel, CLIPTextModelWithProjection
-
-    torch_dtype = torch.float16 if dtype == "fp16" else torch.float32
-    dummy_ids = torch.randint(0, 49408, (1, 77))
-
-    # --- Text Encoder 1 (CLIP-L) ---
-    out_dir1 = models_dir / f"text_encoder_1_{dtype}"
-    if not (out_dir1 / "model.onnx").exists():
-        out_dir1.mkdir(parents=True, exist_ok=True)
-        logger.info("Exporting Text Encoder 1 (%s)...", dtype)
-
-        class TE1(torch.nn.Module):
-            def __init__(self, te):
-                super().__init__()
-                self.te = te
-
-            def forward(self, input_ids):
-                return self.te(input_ids, output_hidden_states=True).hidden_states[-2]
-
-        te1 = CLIPTextModel.from_pretrained(
-            MODEL_ID, subfolder="text_encoder", torch_dtype=torch_dtype
-        )
-        te1.eval()
-        torch.onnx.export(
-            TE1(te1).eval(),
-            (dummy_ids,),
-            str(out_dir1 / "model.onnx"),
-            input_names=["input_ids"],
-            output_names=["hidden_states"],
-            opset_version=17,
-            do_constant_folding=True,
-            dynamo=True,
-            external_data=False,
-        )
-        logger.info("  Saved: %s", out_dir1 / "model.onnx")
-        del te1
-    else:
-        logger.info("Text Encoder 1 already exported: %s", out_dir1)
-
-    # --- Text Encoder 2 (OpenCLIP-bigG) ---
-    out_dir2 = models_dir / f"text_encoder_2_{dtype}"
-    if not (out_dir2 / "model.onnx").exists():
-        out_dir2.mkdir(parents=True, exist_ok=True)
-        logger.info("Exporting Text Encoder 2 (%s)...", dtype)
-
-        class TE2(torch.nn.Module):
-            def __init__(self, te):
-                super().__init__()
-                self.te = te
-
-            def forward(self, input_ids):
-                o = self.te(input_ids, output_hidden_states=True)
-                return o.hidden_states[-2], o.text_embeds
-
-        te2 = CLIPTextModelWithProjection.from_pretrained(
-            MODEL_ID, subfolder="text_encoder_2", torch_dtype=torch_dtype
-        )
-        te2.eval()
-        torch.onnx.export(
-            TE2(te2).eval(),
-            (dummy_ids,),
-            str(out_dir2 / "model.onnx"),
-            input_names=["input_ids"],
-            output_names=["hidden_states", "text_embeds"],
-            opset_version=17,
-            do_constant_folding=True,
-            dynamo=True,
-            external_data=True,
-        )
-        logger.info("  Saved: %s", out_dir2 / "model.onnx")
-        del te2
-    else:
-        logger.info("Text Encoder 2 already exported: %s", out_dir2)
-
-
-# ---------------------------------------------------------------------------
-# UNet
-# ---------------------------------------------------------------------------
-
-
-def _download_int8_unet(models_dir: pathlib.Path) -> None:
-    """Download pre-quantized W8A8 int8 UNet from Azure sharkpublic."""
-    out_dir = models_dir / "unet_int8"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for fname in _INT8_UNET_FILES:
-        dest = out_dir / fname
-        if dest.exists():
-            logger.info("  Already exists: %s", dest)
-            continue
-        url = f"{_INT8_UNET_AZURE_BASE}/{fname}"
-        logger.info("  Downloading %s ...", fname)
-        urllib.request.urlretrieve(url, dest)
-        logger.info("  Saved: %s (%.1f MB)", dest, dest.stat().st_size / 1e6)
+    """Download both CLIP text encoders."""
+    _download_component(models_dir, "text_encoder_1", dtype)
+    _download_component(models_dir, "text_encoder_2", dtype)
 
 
 def export_unet(models_dir: pathlib.Path, dtype: str) -> None:
-    """Export (or download) SDXL UNet.
-
-    For ``fp32`` / ``fp16``: exports from HuggingFace diffusers.
-    For ``int8``: downloads the pre-quantized W8A8 ONNX from Azure.
-
-    Args:
-        models_dir: Root directory for cached models.
-        dtype: ``"fp32"``, ``"fp16"``, or ``"int8"``.
-    """
-    if dtype == "int8":
-        _download_int8_unet(models_dir)
-        return
-
-    import torch
-    import onnx
-    from onnx.external_data_helper import convert_model_to_external_data
-    from diffusers import UNet2DConditionModel
-
-    from .onnx_utils import (
-        inline_slice_constants,
-        patch_resize_ops,
-        fix_fp16_type_mismatches,
-    )
-
-    out_dir = models_dir / f"unet_{dtype}"
-    if (out_dir / "model.onnx").exists():
-        logger.info("UNet already exported: %s", out_dir)
-        return
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    torch_dtype = torch.float16 if dtype == "fp16" else torch.float32
-    logger.info("Exporting UNet (%s) — this takes a few minutes...", dtype)
-
-    unet = UNet2DConditionModel.from_pretrained(
-        MODEL_ID, subfolder="unet", torch_dtype=torch_dtype
-    )
-    unet.eval()
-
-    class Wrapper(torch.nn.Module):
-        def __init__(self, unet):
-            super().__init__()
-            self.unet = unet
-
-        def forward(
-            self, latent_sample, timestep, encoder_hidden_states, text_embeds, time_ids
-        ):
-            return self.unet(
-                latent_sample,
-                timestep,
-                encoder_hidden_states=encoder_hidden_states,
-                added_cond_kwargs={"text_embeds": text_embeds, "time_ids": time_ids},
-                return_dict=False,
-            )[0]
-
-    out_path = str(out_dir / "model.onnx")
-    prog = torch.onnx.export(
-        Wrapper(unet).eval(),
-        (
-            torch.randn(1, 4, 128, 128, dtype=torch_dtype),
-            torch.tensor([250], dtype=torch_dtype),
-            torch.randn(1, 77, 2048, dtype=torch_dtype),
-            torch.randn(1, 1280, dtype=torch_dtype),
-            torch.tensor([[1024, 1024, 0, 0, 1024, 1024]], dtype=torch_dtype),
-        ),
-        input_names=[
-            "latent_sample",
-            "timestep",
-            "encoder_hidden_states",
-            "text_embeds",
-            "time_ids",
-        ],
-        output_names=["sample"],
-        dynamo=True,
-        external_data=True,
-    )
-    prog.save(out_path)
-
-    model = onnx.load(out_path, load_external_data=True)
-    model = inline_slice_constants(model)
-    model = patch_resize_ops(model)
-    if dtype == "fp16":
-        model = fix_fp16_type_mismatches(model)
-    convert_model_to_external_data(
-        model,
-        all_tensors_to_one_file=True,
-        location="model.onnx.data",
-        size_threshold=1024,
-    )
-    onnx.save(model, out_path)
-    logger.info("  Saved: %s", out_path)
-    del unet
-
-
-# ---------------------------------------------------------------------------
-# VAE
-# ---------------------------------------------------------------------------
+    """Download SDXL UNet (fp32, fp16, or int8 W8A8)."""
+    _download_component(models_dir, "unet", dtype)
 
 
 def export_vae(models_dir: pathlib.Path, dtype: str) -> None:
-    """Export SDXL VAE decoder from HuggingFace.
-
-    Args:
-        models_dir: Root directory for cached models.
-        dtype: ``"fp32"`` or ``"fp16"``.
-    """
-    import torch
-    import onnx
-    from diffusers import AutoencoderKL
-
-    from .onnx_utils import patch_resize_ops
-
-    out_dir = models_dir / f"vae_decoder_{dtype}"
-    if (out_dir / "model.onnx").exists():
-        logger.info("VAE already exported: %s", out_dir)
-        return
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    torch_dtype = torch.float16 if dtype == "fp16" else torch.float32
-    logger.info("Exporting VAE decoder (%s)...", dtype)
-
-    vae = AutoencoderKL.from_pretrained(
-        "madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch_dtype
-    )
-    vae.eval()
-
-    class Decoder(torch.nn.Module):
-        def __init__(self, vae):
-            super().__init__()
-            self.vae = vae
-
-        def forward(self, latent_sample):
-            return self.vae.decode(latent_sample, return_dict=False)[0]
-
-    out_path = str(out_dir / "model.onnx")
-    torch.onnx.export(
-        Decoder(vae).eval(),
-        (torch.randn(1, 4, 128, 128, dtype=torch_dtype),),
-        out_path,
-        input_names=["latent_sample"],
-        output_names=["sample"],
-        opset_version=18,
-        do_constant_folding=True,
-    )
-
-    model = onnx.load(out_path)
-    model = patch_resize_ops(model)
-    onnx.save(model, out_path)
-    logger.info("  Saved: %s", out_path)
-    del vae
+    """Download SDXL VAE decoder."""
+    _download_component(models_dir, "vae_decoder", dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +230,7 @@ def export_vae(models_dir: pathlib.Path, dtype: str) -> None:
 
 
 def ensure_models(models_dir: pathlib.Path, dtype: str) -> None:
-    """Export or download all models needed for the given dtype.
+    """Download all models needed for the given dtype.
 
     Args:
         models_dir: Root directory for cached models.

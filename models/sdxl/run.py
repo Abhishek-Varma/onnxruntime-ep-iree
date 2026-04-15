@@ -29,7 +29,6 @@ from .export import MODEL_ID, ensure_models
 logger = logging.getLogger(__name__)
 
 INT8_SEQ_LEN = 64
-INT8_UNET_ONNX = "sdxl_int8_unet_native_i8.onnx"
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +48,8 @@ def get_iree_device(driver):
 
 def create_session(model_path, iree_device, provider_options, name=None):
     """Create an ORT InferenceSession with the IREE EP."""
-    label = name or pathlib.Path(model_path).parent.name
+    p = pathlib.Path(model_path)
+    label = name or f"{p.parent.parent.name}/{p.parent.name}"
     logger.info("  Compiling %s...", label)
     t = time.time()
     so = ort.SessionOptions()
@@ -72,7 +72,7 @@ def run_pipeline(args, models_dir, iree_device, provider_options):
     io_np_dtype = np.float16 if args.dtype in ("fp16", "int8") else np.float32
 
     def model_path(component, dt):
-        return models_dir / f"{component}_{dt}" / "model.onnx"
+        return models_dir / component / dt / "model.onnx"
 
     # --- 1. Tokenize ---
     logger.info("[1/4] Tokenizing...")
@@ -126,15 +126,7 @@ def run_pipeline(args, models_dir, iree_device, provider_options):
     # --- 3. UNet Denoise ---
     logger.info("[3/4] Denoising (%d steps, %s UNet)...", args.steps, args.dtype)
 
-    if use_int8:
-        unet_path = models_dir / "unet_int8" / INT8_UNET_ONNX
-        unet = create_session(
-            unet_path, iree_device, provider_options, name="unet_int8"
-        )
-    else:
-        unet = create_session(
-            model_path("unet", args.dtype), iree_device, provider_options
-        )
+    unet = create_session(model_path("unet", args.dtype), iree_device, provider_options)
 
     time_ids = np.array([[1024, 1024, 0, 0, 1024, 1024]], dtype=io_np_dtype)
 
