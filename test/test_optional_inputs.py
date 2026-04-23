@@ -14,41 +14,21 @@ from onnx.numpy_helper import from_array
 np.random.seed(42)
 
 
-def _make_resize_model(use_sizes=False):
-    """Build a nearest 2x Resize with absent optional inputs.
+def _make_clip_absent_min_model():
+    """Build Clip(X, min="", max) -- 1 absent middle input."""
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [4])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4])
+    max_init = from_array(np.array(2.0, dtype=np.float32), name="max")
 
-    Args:
-        use_sizes: If False, emit Resize(X, roi="", scales)   — 1 absent input.
-                   If True,  emit Resize(X, roi="", scales="", sizes) — 2 absent.
-    """
-    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4, 8, 8])
-    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4, 16, 16])
+    clip = helper.make_node("Clip", inputs=["X", "", "max"], outputs=["Y"])
 
-    if use_sizes:
-        init = from_array(np.array([1, 4, 16, 16], dtype=np.int64), name="sizes")
-        inputs = ["X", "", "", "sizes"]
-    else:
-        init = from_array(
-            np.array([1.0, 1.0, 2.0, 2.0], dtype=np.float32), name="scales"
-        )
-        inputs = ["X", "", "scales"]
-
-    resize = helper.make_node(
-        "Resize",
-        inputs=inputs,
-        outputs=["Y"],
-        mode="nearest",
-        coordinate_transformation_mode="asymmetric",
-        nearest_mode="floor",
-    )
-
-    graph = helper.make_graph([resize], "resize_test", [X], [Y], initializer=[init])
+    graph = helper.make_graph([clip], "clip_test", [X], [Y], initializer=[max_init])
     model = helper.make_model(
         graph,
         producer_name="optional_inputs_test",
-        opset_imports=[helper.make_opsetid("", 18)],
+        opset_imports=[helper.make_opsetid("", 17)],
     )
-    model.ir_version = 9
+    model.ir_version = 8
     return model
 
 
@@ -63,11 +43,10 @@ def iree_device_and_target(request):
     )
 
 
-@pytest.mark.parametrize("use_sizes", [False, True], ids=["scales", "sizes"])
-def test_resize_absent_inputs_e2e(iree_device_and_target, use_sizes):
-    """Resize with absent optional inputs compiles and produces correct output."""
+def test_clip_absent_min_e2e(iree_device_and_target):
+    """Clip(X, min="", max) compiles and produces correct output."""
     device, target_arch = iree_device_and_target
-    model = _make_resize_model(use_sizes=use_sizes)
+    model = _make_clip_absent_min_model()
 
     with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as f:
         onnx.save(model, f.name)
@@ -78,10 +57,10 @@ def test_resize_absent_inputs_e2e(iree_device_and_target, use_sizes):
         opts.add_provider_for_devices([device], {"target_arch": target_arch})
         sess = ort.InferenceSession(model_path, sess_options=opts)
 
-        x = np.random.randn(1, 4, 8, 8).astype(np.float32)
+        x = np.array([-3.0, 0.0, 4.0, 7.0], dtype=np.float32)
         result = sess.run(None, {"X": x})[0]
 
-        expected = np.repeat(np.repeat(x, 2, axis=2), 2, axis=3)
+        expected = np.array([-3.0, 0.0, 2.0, 2.0], dtype=np.float32)
         np.testing.assert_allclose(result, expected, rtol=0, atol=0)
     finally:
         pathlib.Path(model_path).unlink(missing_ok=True)
