@@ -10,6 +10,9 @@ import pytest
 from onnx import TensorProto, helper
 from onnx.numpy_helper import from_array
 
+# Fixed seed for reproducibility.
+np.random.seed(42)
+
 
 def _make_resize_model(use_sizes=False):
     """Build a nearest 2x Resize with absent optional inputs.
@@ -49,10 +52,21 @@ def _make_resize_model(use_sizes=False):
     return model
 
 
-@pytest.mark.gpu
+@pytest.fixture(params=["cpu", "gpu"])
+def iree_device_and_target(request):
+    """Yield (device, target_arch) for each backend."""
+    if request.param == "cpu":
+        return request.getfixturevalue("iree_device"), "host"
+    return (
+        request.getfixturevalue("iree_gpu_device"),
+        request.getfixturevalue("gpu_target"),
+    )
+
+
 @pytest.mark.parametrize("use_sizes", [False, True], ids=["scales", "sizes"])
-def test_resize_absent_inputs_e2e(iree_gpu_device, gpu_target, use_sizes):
+def test_resize_absent_inputs_e2e(iree_device_and_target, use_sizes):
     """Resize with absent optional inputs compiles and produces correct output."""
+    device, target_arch = iree_device_and_target
     model = _make_resize_model(use_sizes=use_sizes)
 
     with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as f:
@@ -61,7 +75,7 @@ def test_resize_absent_inputs_e2e(iree_gpu_device, gpu_target, use_sizes):
 
     try:
         opts = ort.SessionOptions()
-        opts.add_provider_for_devices([iree_gpu_device], {"target_arch": gpu_target})
+        opts.add_provider_for_devices([device], {"target_arch": target_arch})
         sess = ort.InferenceSession(model_path, sess_options=opts)
 
         x = np.random.randn(1, 4, 8, 8).astype(np.float32)
