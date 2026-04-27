@@ -115,6 +115,10 @@ def run_pipeline(args, models_dir, iree_device, provider_options):
     logger.info("  Text encoding: %.1fs", time.time() - t0)
 
     if use_int8:
+        # SDXL supports up to 77 tokens, but 64 is chosen deliberately: it
+        # is the nearest power-of-two-aligned length that fits within the
+        # 77-token limit, giving the hardware a nicely aligned shape to work
+        # with. Truncate longer sequences to 64; pad shorter ones with zeros.
         if encoder_hs.shape[1] > INT8_SEQ_LEN:
             encoder_hs = encoder_hs[:, :INT8_SEQ_LEN, :]
             neg_encoder_hs = neg_encoder_hs[:, :INT8_SEQ_LEN, :]
