@@ -23,6 +23,7 @@
 #ifndef ONNXRUNTIME_EP_IREE_SRC_MLIR_GEN_H_
 #define ONNXRUNTIME_EP_IREE_SRC_MLIR_GEN_H_
 
+#include <cstddef>
 #include <string>
 #include <utility>
 #include <vector>
@@ -33,6 +34,16 @@
 #include "support.h"
 
 namespace onnxruntime::iree {
+
+// Per-output binding info produced by GenerateMlir, consumed by
+// IreeEp::ComputeImpl to decide how to hand each output to IREE.
+struct OutputBindingInfo {
+  // True iff the generated MLIR carries a caller-provided storage arg for
+  // this result.
+  bool is_tied = false;
+  // Static shape from the ONNX graph; only valid when is_tied.
+  std::vector<int64_t> shape;
+};
 
 // Target configuration passed to the MLIR generator. Always populated with the
 // EP's main target arch and backend. When the graph contains
@@ -73,7 +84,9 @@ MaybeError GenerateMlir(
     const std::string& mlir_path, const std::string& irpa_path,
     const std::vector<std::pair<std::string, DimSpecVariant>>& variants,
     std::vector<std::string>& out_function_names, ParameterIndexPtr& out_index,
-    ParameterProviderPtr& out_provider, TargetConfig target_config);
+    ParameterProviderPtr& out_provider, TargetConfig target_config,
+    std::vector<OutputBindingInfo>& out_output_bindings,
+    bool enable_inplace_outputs = false);
 
 }  // namespace onnxruntime::iree
 
