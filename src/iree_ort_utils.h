@@ -203,6 +203,29 @@ OrtStatus* OrtTensorToIreeBufferView(const Ort::ConstValue& ort_value,
                                      const OrtEpApi& ep_api,
                                      const Ort::Logger& logger);
 
+// Allocates a fresh IREE device-local buffer view sized for the shape and
+// element type of |ort_value|, WITHOUT reading or copying its contents.
+//
+// Intended for caller-provided output storage when the ORT-allocated output
+// tensor is host-resident (so we can't zero-copy wrap it). The kernel writes
+// the output into the returned buffer; the caller is responsible for the
+// post-execution device-to-host copy back into |ort_value|.
+//
+// For input tensors (which need their host data on the device) use
+// OrtTensorToIreeBufferView instead.
+//
+// Parameters:
+//   ort_value - ORT tensor whose shape and element type seed the allocation
+//               (contents are not read)
+//   device - IREE HAL device for allocation
+//   allocator - Device allocator from session
+//   out_buffer_view - Output buffer view (caller must release)
+//
+// Returns nullptr on success, OrtStatus* on error.
+OrtStatus* AllocateIreeStorageForOrtTensor(
+    const Ort::ConstValue& ort_value, iree_hal_device_t* device,
+    iree_hal_allocator_t* allocator, iree_hal_buffer_view_t** out_buffer_view);
+
 // Copies data from an IREE buffer view to an ORT output tensor.
 //
 // If the output tensor is on an IREE device (detected via vendor_id), the

@@ -547,27 +547,36 @@ OrtStatus* ORT_API_CALL IreeNodeComputeInfo::ComputeImpl(
     Ort::UnownedValue ort_out =
         ctx.GetOutput(i, binding.shape.data(), binding.shape.size());
 
-    // Vendor-id check decides whether `OrtTensorToIreeBufferView` will
-    // go through zero-copy or allocate-and-copy. Mirrors the predicate inside
-    // `OrtTensorToIreeBufferView` helper.
+    // Vendor-id check decides whether the ORT tensor lives on our device:
+    //  - on device: zero-copy wrap via OrtTensorToIreeBufferView so the
+    //    kernel writes directly into the caller's buffer (true in-place).
+    //  - on host: allocate an EP-side device-local storage buffer with
+    //    AllocateIreeStorageForOrtTensor (no contents are copied; the
+    //    output bytes are uninitialized on entry and the kernel produces
+    //    them) and fall back to the post-execution device-to-host copy.
     const OrtMemoryDevice* mem_device = info->ep.ep_api.Value_GetMemoryDevice(
         static_cast<const OrtValue*>(ort_out));
     bool on_iree_device =
         mem_device &&
         info->ep.ep_api.MemoryDevice_GetVendorId(mem_device) == kEpVendorId;
-    if (!on_iree_device) {
-      ORT_CXX_LOGF_NOEXCEPT(
-          info->ep.Logger(), ORT_LOGGING_LEVEL_VERBOSE,
-          "IREE EP: tied output %zu is not on the IREE device; pushing an "
-          "EP-side storage buffer and copying back after invocation",
-          i);
-    }
 
     iree_hal_buffer_view_t* storage_view = nullptr;
-    ORT_RETURN_IF_ERROR(OrtTensorToIreeBufferView(
-        Ort::ConstValue{static_cast<const OrtValue*>(ort_out)}, device,
-        allocator, iree_allocator_system(), &storage_view, info->ep.ep_api,
-        info->ep.Logger()));
+    if (on_iree_device) {
+      ORT_RETURN_IF_ERROR(OrtTensorToIreeBufferView(
+          Ort::ConstValue{static_cast<const OrtValue*>(ort_out)}, device,
+          allocator, iree_allocator_system(), &storage_view, info->ep.ep_api,
+          info->ep.Logger()));
+    } else {
+      ORT_CXX_LOGF_NOEXCEPT(
+          info->ep.Logger(), ORT_LOGGING_LEVEL_VERBOSE,
+          "IREE EP: tied output %zu is not on the IREE device; allocating "
+          "an EP-side storage buffer (no copy) and copying back after "
+          "invocation",
+          i);
+      ORT_RETURN_IF_ERROR(AllocateIreeStorageForOrtTensor(
+          Ort::ConstValue{static_cast<const OrtValue*>(ort_out)}, device,
+          allocator, &storage_view));
+    }
     tied_output_views.emplace_back(storage_view);
     IREE_ORT_RETURN_IF_ERROR(iree_runtime_call_inputs_push_back_buffer_view(
         call.Get(), storage_view));

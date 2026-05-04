@@ -134,11 +134,12 @@ static bool IsStaticShape(const Ort::ConstTypeInfo& type_info) {
   return true;
 }
 
-// Emits the storage-arg torch type, which differs from the body's value-
-// semantics type by using NonValueTensor (`!torch.tensor` vs `!torch.vtensor`).
-// The mutable form is what `torch.overwrite.tensor.contents` requires.
-static ErrorOr<std::string> FormatStorageTensorType(
-    const Ort::ConstTypeInfo& type_info) {
+// Shared body of FormatTensorType / FormatStorageTensorType. The only
+// difference between the value-semantics form (`!torch.vtensor`) and the
+// mutable storage form (`!torch.tensor`) is the leading keyword; everything
+// else (shape, dtype) is identical.
+static ErrorOr<std::string> FormatTorchTensorTypeImpl(
+    const Ort::ConstTypeInfo& type_info, bool value_semantics) {
   if (type_info.GetONNXType() != ONNX_TYPE_TENSOR) {
     return errorWithCode(ErrorCode::kNotImplemented,
                          "Non-tensor type {} not supported",
@@ -149,39 +150,9 @@ static ErrorOr<std::string> FormatStorageTensorType(
   auto dtype = tensor_info.GetElementType();
 
   std::ostringstream ss;
-  ss << "!torch.tensor<[";
+  ss << (value_semantics ? "!torch.vtensor<[" : "!torch.tensor<[");
   for (size_t i = 0; i < shape.size(); ++i) {
     if (i > 0) ss << ",";
-    if (shape[i] < 0) {
-      ss << "?";
-    } else {
-      ss << shape[i];
-    }
-  }
-  IREE_EP_ASSIGN_OR_RETURN(std::string elem_type, GetElementType(dtype));
-  ss << "]," << elem_type << ">";
-  return ss.str();
-}
-
-// Formats a tensor type as !torch.vtensor<[dims],dtype>.
-// Dynamic dims are always emitted as "?".
-ErrorOr<std::string> FormatTensorType(const Ort::ConstTypeInfo& type_info) {
-  if (type_info.GetONNXType() != ONNX_TYPE_TENSOR) {
-    return errorWithCode(ErrorCode::kNotImplemented,
-                         "Non-tensor type {} not supported",
-                         static_cast<int>(type_info.GetONNXType()));
-  }
-
-  auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
-  auto shape = tensor_info.GetShape();
-  auto dtype = tensor_info.GetElementType();
-
-  std::ostringstream ss;
-  ss << "!torch.vtensor<[";
-  for (size_t i = 0; i < shape.size(); ++i) {
-    if (i > 0) {
-      ss << ",";
-    }
     if (shape[i] < 0) {
       // TODO: Ensure that dynamic dimensions are actually represented as -1. I
       // checked and they seem to but an example to check would be good.
@@ -193,6 +164,33 @@ ErrorOr<std::string> FormatTensorType(const Ort::ConstTypeInfo& type_info) {
   IREE_EP_ASSIGN_OR_RETURN(std::string elem_type, GetElementType(dtype));
   ss << "]," << elem_type << ">";
   return ss.str();
+}
+
+// Formats a tensor type as !torch.tensor<[dims],dtype> (mutable / non-value
+// semantics). This is the form `torch.overwrite.tensor.contents` requires
+// for its destination operand.
+static ErrorOr<std::string> FormatStorageTensorType(
+    const Ort::ConstTypeInfo& type_info) {
+  return FormatTorchTensorTypeImpl(type_info, /*value_semantics=*/false);
+}
+
+// Formats a tensor type as !torch.vtensor<[dims],dtype>.
+// Dynamic dims are always emitted as "?".
+ErrorOr<std::string> FormatTensorType(const Ort::ConstTypeInfo& type_info) {
+  return FormatTorchTensorTypeImpl(type_info, /*value_semantics=*/true);
+}
+
+// Internal SSA names for the in-place output pattern. The suffix is the
+// position of the storage arg in the function signature, which is unique
+// within a function and cannot be derived from any sanitized ONNX
+// identifier (which never starts with `__iree_ep_`), so these are
+// guaranteed to be collision-free with names emitted elsewhere in the
+// generator.
+static std::string InPlaceStorageName(size_t storage_arg_pos) {
+  return std::format("__iree_ep_inplace_storage_{}", storage_arg_pos);
+}
+static std::string InPlaceStorageVtName(size_t storage_arg_pos) {
+  return std::format("__iree_ep_inplace_storage_vt_{}", storage_arg_pos);
 }
 
 // Formats a tensor type as tensor<dimsxdtype> (standard MLIR format).
@@ -460,11 +458,11 @@ class MlirGenerator {
       if (storage_arg_pos > 0) {
         args << ", ";
       }
-      std::string name = SanitizeName(graph_outputs_[i].GetName());
       IREE_EP_ASSIGN_OR_RETURN(
           std::string storage_type,
           FormatStorageTensorType(graph_outputs_[i].TypeInfo()));
-      args << "%out_" << name << ": " << storage_type;
+      args << "%" << InPlaceStorageName(storage_arg_pos) << ": "
+           << storage_type;
       storage_arg_indices_[i] = storage_arg_pos++;
     }
 
@@ -1104,24 +1102,29 @@ class MlirGenerator {
   MaybeError EmitReturn() {
     // For each tied (static-shape) output, write the freshly-computed result
     // into the caller-provided storage arg, then read it back as a vtensor.
-    // Returning the post-overwrite read (instead of the original SSA result)
-    // is what lets the codegen fold the result allocation into the storage
-    // arg's buffer.
+    // The torch.copy.to_vtensor is purely a value-semantics bridge so we can
+    // satisfy the function's `-> !torch.vtensor` return type from the
+    // mutable `!torch.tensor` storage arg; it does NOT introduce a new
+    // allocation. The IREE pipeline (Torch -> Linalg -> Stream) recognizes
+    // the overwrite + copy.to_vtensor pair against a function-level storage
+    // arg and folds the result into the storage arg's backing buffer.
     for (size_t i = 0; i < graph_outputs_.size(); ++i) {
       if (storage_arg_indices_[i] == kNoStorageArg) continue;
       std::string name = SanitizeName(graph_outputs_[i].GetName());
+      std::string storage_name = InPlaceStorageName(storage_arg_indices_[i]);
+      std::string storage_vt_name =
+          InPlaceStorageVtName(storage_arg_indices_[i]);
       IREE_EP_ASSIGN_OR_RETURN(std::string vtensor_type,
                                FormatTensorType(graph_outputs_[i].TypeInfo()));
       IREE_EP_ASSIGN_OR_RETURN(
           std::string storage_type,
           FormatStorageTensorType(graph_outputs_[i].TypeInfo()));
       out_ << std::format(
-          "    torch.overwrite.tensor.contents %{0} overwrites %out_{0} : "
-          "{1}, {2}\n",
-          name, vtensor_type, storage_type);
-      out_ << std::format(
-          "    %{0}__storage_vt = torch.copy.to_vtensor %out_{0} : {1}\n", name,
-          vtensor_type);
+          "    torch.overwrite.tensor.contents %{0} overwrites %{1} : "
+          "{2}, {3}\n",
+          name, storage_name, vtensor_type, storage_type);
+      out_ << std::format("    %{0} = torch.copy.to_vtensor %{1} : {2}\n",
+                          storage_vt_name, storage_name, vtensor_type);
     }
 
     std::ostringstream ret_values;
@@ -1131,11 +1134,10 @@ class MlirGenerator {
         ret_values << ", ";
         ret_types << ", ";
       }
-      std::string name = SanitizeName(graph_outputs_[i].GetName());
       if (storage_arg_indices_[i] != kNoStorageArg) {
-        ret_values << "%" << name << "__storage_vt";
+        ret_values << "%" << InPlaceStorageVtName(storage_arg_indices_[i]);
       } else {
-        ret_values << "%" << name;
+        ret_values << "%" << SanitizeName(graph_outputs_[i].GetName());
       }
       IREE_EP_ASSIGN_OR_RETURN(std::string ret_type,
                                FormatTensorType(graph_outputs_[i].TypeInfo()));
