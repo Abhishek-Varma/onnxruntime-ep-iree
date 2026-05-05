@@ -411,6 +411,10 @@ class MlirGenerator {
   }
 
   MaybeError EmitFunctionBody() {
+    // Reset per-function state.  %__none is emitted lazily on first use and
+    // each function gets its own definition.
+    none_emitted_ = false;
+
     // Emit dim constraints (util.assume.int + flow.tensor.tie_shape).
     IREE_EP_RETURN_IF_ERROR(EmitDimConstraints());
 
@@ -518,23 +522,32 @@ class MlirGenerator {
     }
 
     // Build input SSA references.
+    // Empty-name inputs represent absent optional arguments in ONNX.  We emit
+    // torch.constant.none for them so that positional semantics are preserved
+    // (matching torch-mlir's OnnxImporter, which uses nv_map_[""]).
     std::ostringstream in_names;
     std::ostringstream in_types;
     bool first_input = true;
+
     for (size_t i = 0; i < inputs.size(); ++i) {
-      if (!inputs[i]) {
-        // Skip invalid inputs (optional inputs can be empty/null).
-        continue;
-      }
-      std::string input_name = inputs[i].GetName();
-      if (input_name.empty()) {
-        continue;
-      }
       if (!first_input) {
         in_names << ", ";
         in_types << ", ";
       }
       first_input = false;
+
+      std::string input_name = inputs[i] ? inputs[i].GetName() : std::string();
+      if (input_name.empty()) {
+        // Absent optional ONNX input: reference the function-scoped
+        // %__none SSA value, emitting its definition lazily on first use.
+        if (!none_emitted_) {
+          out_ << "    %__none = torch.constant.none\n";
+          none_emitted_ = true;
+        }
+        in_names << "%__none";
+        in_types << "!torch.none";
+        continue;
+      }
       in_names << "%" << SanitizeName(input_name);
       IREE_EP_ASSIGN_OR_RETURN(std::string in_type,
                                FormatTensorType(inputs[i].TypeInfo()));
@@ -1197,6 +1210,9 @@ class MlirGenerator {
   int extern_id_ = 0;
   // Symbolic dimension names per graph input (parallel to graph_inputs_).
   std::vector<std::vector<const char*>> input_symbolic_dims_;
+  // Whether %__none = torch.constant.none has been emitted in the current
+  // function.  Reset at the start of each function body.
+  bool none_emitted_ = false;
 };
 
 // Builds an IRPA parameter archive for large initializers.

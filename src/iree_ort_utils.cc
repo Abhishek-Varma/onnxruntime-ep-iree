@@ -308,6 +308,14 @@ std::string SanitizeName(const std::string& name) {
     result = std::format("${:02X}$", static_cast<unsigned char>(first)) +
              result.substr(1);
   }
+  // Reserve a leading double underscore for internal SSA values emitted by
+  // the MLIR generator (e.g. %__none, %__raw_<name>). If a user-supplied
+  // name sanitizes to something starting with "__", escape the first
+  // underscore so it cannot collide with our internal names.
+  if (result.size() >= 2 && result[0] == '_' && result[1] == '_') {
+    result = std::format("${:02X}$", static_cast<unsigned char>('_')) +
+             result.substr(1);
+  }
   return result.empty() ? "_unnamed" : result;
 }
 
