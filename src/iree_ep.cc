@@ -547,18 +547,27 @@ OrtStatus* ORT_API_CALL IreeNodeComputeInfo::ComputeImpl(
     Ort::UnownedValue ort_out =
         ctx.GetOutput(i, binding.shape.data(), binding.shape.size());
 
-    // Vendor-id check decides whether the ORT tensor lives on our device:
+    // Vendor-id + device-id check decides whether the ORT tensor lives on
+    // our IREE device:
     //  - on device: zero-copy wrap via OrtTensorToIreeBufferView so the
     //    kernel writes directly into the caller's buffer (true in-place).
-    //  - on host: allocate an EP-side device-local storage buffer with
-    //    AllocateIreeStorageForOrtTensor (no contents are copied; the
-    //    output bytes are uninitialized on entry and the kernel produces
-    //    them) and fall back to the post-execution device-to-host copy.
+    //  - elsewhere (host or another IREE device): allocate an EP-side
+    //    device-local storage buffer with AllocateIreeStorageForOrtTensor
+    //    (no contents are copied; the output bytes are uninitialized on
+    //    entry and the kernel produces them) and fall back to the
+    //    post-execution device-to-host copy.
+    // TODO: Add support for device interoperability.
     const OrtMemoryDevice* mem_device = info->ep.ep_api.Value_GetMemoryDevice(
         static_cast<const OrtValue*>(ort_out));
-    bool on_iree_device =
-        mem_device &&
-        info->ep.ep_api.MemoryDevice_GetVendorId(mem_device) == kEpVendorId;
+    bool on_iree_device = false;
+    if (mem_device) {
+      uint32_t mem_vendor_id =
+          info->ep.ep_api.MemoryDevice_GetVendorId(mem_device);
+      uint32_t mem_device_id =
+          info->ep.ep_api.MemoryDevice_GetDeviceId(mem_device);
+      on_iree_device = (mem_vendor_id == kEpVendorId &&
+                        mem_device_id == info->ep.DeviceId());
+    }
 
     iree_hal_buffer_view_t* storage_view = nullptr;
     if (on_iree_device) {

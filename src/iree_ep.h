@@ -70,6 +70,9 @@ class IreeEp : public OrtEp, public ApiPtrs {
   // Accessor for the IREE device (from factory's device cache).
   [[nodiscard]] iree_hal_device_t* IreeDevice() const;
 
+  // Accessor for the IREE device ID.
+  [[nodiscard]] uint32_t DeviceId() const { return device_id_; }
+
   // Accessor for the logger.
   [[nodiscard]] const Ort::Logger& Logger() const { return logger_; }
 

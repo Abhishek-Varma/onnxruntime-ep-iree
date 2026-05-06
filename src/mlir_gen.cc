@@ -180,12 +180,15 @@ ErrorOr<std::string> FormatTensorType(const Ort::ConstTypeInfo& type_info) {
   return FormatTorchTensorTypeImpl(type_info, /*value_semantics=*/true);
 }
 
-// Internal SSA names for the in-place output pattern. The suffix is the
-// position of the storage arg in the function signature, which is unique
-// within a function and cannot be derived from any sanitized ONNX
-// identifier (which never starts with `__iree_ep_`), so these are
-// guaranteed to be collision-free with names emitted elsewhere in the
-// generator.
+// Internal SSA names for the in-place output pattern.
+//
+// Collision-free with any sanitized ONNX identifier because SanitizeName
+// reserves the leading `__` prefix (any user name that would sanitize to
+// `__...` has its first underscore escaped to `$5F$`).
+//
+// TODO: replace this prefix scheme once the planned graph-wide name
+// uniquifier (tracked in a follow-up PR) lands; that helper will subsume
+// this and the other ad-hoc prefixes emitted by the MLIR generator.
 static std::string InPlaceStorageName(size_t storage_arg_pos) {
   return std::format("__iree_ep_inplace_storage_{}", storage_arg_pos);
 }
@@ -273,6 +276,7 @@ class MlirGenerator {
     function_names.clear();
     function_names.reserve(variants.size());
 
+    ComputeOutputBindings();
     EmitModulePrologue();
     for (const auto& v : variants) {
       ConfigureForVariant(*v.specs, v.suffix);
@@ -354,6 +358,32 @@ class MlirGenerator {
     }
   }
 
+  // Computes which outputs are tied to a caller-provided storage arg and the
+  // storage arg's position in the function signature. Invariant across
+  // variants, so call once after CollectMetadata() and before any variant
+  // emission.
+  // TODO: Revisit once dynamic output shapes are supported.
+  void ComputeOutputBindings() {
+    output_bindings_.assign(graph_outputs_.size(), OutputBindingInfo{});
+    storage_arg_indices_.assign(graph_outputs_.size(), kNoStorageArg);
+    if (!enable_inplace_outputs_) {
+      // Disabled by session option: leave every binding marked
+      // is_tied=false so EmitFunctionHeader/EmitReturn fall back to the
+      // legacy out-of-place lowering and the runtime side stays on the
+      // post-execution copy path.
+      return;
+    }
+    size_t storage_arg_pos = graph_inputs_.size();
+    for (size_t i = 0; i < graph_outputs_.size(); ++i) {
+      const auto type_info = graph_outputs_[i].TypeInfo();
+      if (!IsStaticShape(type_info)) continue;
+      auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
+      output_bindings_[i].is_tied = true;
+      output_bindings_[i].shape = tensor_info.GetShape();
+      storage_arg_indices_[i] = storage_arg_pos++;
+    }
+  }
+
   // Configures the generator for a variant (dim specs, function name suffix).
   // Must be called before EmitFunctionHeader/EmitFunctionBody for each variant.
   void ConfigureForVariant(const DimSpecVariant& specs,
@@ -410,29 +440,6 @@ class MlirGenerator {
   // For static-shape outputs, also emits an extra mutable storage arg per
   // output after the regular inputs.
   MaybeError EmitFunctionHeader() {
-    // Decide which outputs are tied (static-shape) and assign each a position
-    // in the function arg list AFTER the regular inputs. Populate the
-    // per-variant binding info so the runtime side can pre-bind ORT-allocated
-    // output buffers before invoke. The bindings are identical across
-    // variants (static shape doesn't change), so we only populate this on the
-    // first variant emission.
-    if (output_bindings_.empty()) {
-      output_bindings_.assign(graph_outputs_.size(), OutputBindingInfo{});
-      // When the session option disables the in-place pattern, leave every
-      // binding marked is_tied=false so EmitFunctionHeader/EmitReturn fall
-      // back to the legacy out-of-place lowering and the runtime side stays
-      // on the post-execution copy path.
-      if (enable_inplace_outputs_) {
-        for (size_t i = 0; i < graph_outputs_.size(); ++i) {
-          const auto type_info = graph_outputs_[i].TypeInfo();
-          if (!IsStaticShape(type_info)) continue;
-          auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
-          output_bindings_[i].is_tied = true;
-          output_bindings_[i].shape = tensor_info.GetShape();
-        }
-      }
-    }
-
     std::ostringstream args;
     for (size_t i = 0; i < graph_inputs_.size(); ++i) {
       if (i > 0) {
@@ -449,21 +456,18 @@ class MlirGenerator {
     }
 
     // Append storage args for static-shape outputs, in result-index order.
-    // The arg index recorded here (graph_inputs_.size() + counter) is the
+    // Indices were precomputed by ComputeOutputBindings(); each is the
     // position the runtime side pushes the ORT-allocated buffer view at.
-    size_t storage_arg_pos = graph_inputs_.size();
-    storage_arg_indices_.assign(graph_outputs_.size(), kNoStorageArg);
     for (size_t i = 0; i < graph_outputs_.size(); ++i) {
-      if (!output_bindings_[i].is_tied) continue;
-      if (storage_arg_pos > 0) {
+      if (storage_arg_indices_[i] == kNoStorageArg) continue;
+      if (storage_arg_indices_[i] > 0) {
         args << ", ";
       }
       IREE_EP_ASSIGN_OR_RETURN(
           std::string storage_type,
           FormatStorageTensorType(graph_outputs_[i].TypeInfo()));
-      args << "%" << InPlaceStorageName(storage_arg_pos) << ": "
+      args << "%" << InPlaceStorageName(storage_arg_indices_[i]) << ": "
            << storage_type;
-      storage_arg_indices_[i] = storage_arg_pos++;
     }
 
     // Build return types.
@@ -1340,7 +1344,7 @@ class MlirGenerator {
   bool enable_inplace_outputs_ = false;
 
  public:
-  const std::vector<OutputBindingInfo>& output_bindings() const {
+  const std::vector<OutputBindingInfo>& GetOutputBindings() const {
     return output_bindings_;
   }
 };
@@ -1518,7 +1522,7 @@ MaybeError GenerateMlir(
   }
 
   IREE_EP_RETURN_IF_ERROR(gen.BuildParameterArchive(out_index, out_provider));
-  out_output_bindings = gen.output_bindings();
+  out_output_bindings = gen.GetOutputBindings();
   return ok();
 }
 
