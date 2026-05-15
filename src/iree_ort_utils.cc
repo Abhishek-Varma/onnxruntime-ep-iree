@@ -126,13 +126,28 @@ size_t OnnxElementTypeSize(ONNXTensorElementDataType type) {
 // Buffer/Tensor Conversion
 // ============================================================================
 
-OrtStatus* OrtTensorToIreeBufferView(const Ort::ConstValue& ort_value,
-                                     iree_hal_device_t* device,
-                                     iree_hal_allocator_t* allocator,
-                                     iree_allocator_t /*host_allocator*/,
-                                     iree_hal_buffer_view_t** out_buffer_view,
-                                     const OrtEpApi& ep_api,
-                                     const Ort::Logger& logger) {
+// Builds the explicit-error status returned when an ORT tensor's device_id
+// matches kEpVendorId but resolves to a different IREE device than the
+// caller's EP.
+static OrtStatus* MakeCrossDeviceError(const char* role,
+                                       uint32_t tensor_device_id,
+                                       uint32_t ep_device_id) {
+  return Ort::Status(
+             std::format(
+                 "IREE EP: {} tensor lives on a different IREE device "
+                 "(device_id={}) than this EP (device_id={}); cross "
+                 "IREE-device transfer must be done via OrtDataTransfer",
+                 role, tensor_device_id, ep_device_id)
+                 .c_str(),
+             ORT_INVALID_ARGUMENT)
+      .release();
+}
+
+OrtStatus* OrtTensorToIreeBufferView(
+    const Ort::ConstValue& ort_value, iree_hal_device_t* device,
+    iree_hal_allocator_t* allocator, iree_allocator_t /*host_allocator*/,
+    iree_hal_buffer_view_t** out_buffer_view, const OrtEpApi& ep_api,
+    uint32_t ep_device_id, const Ort::Logger& logger) {
   *out_buffer_view = nullptr;
 
   // Get tensor info from ORT.
@@ -163,12 +178,17 @@ OrtStatus* OrtTensorToIreeBufferView(const Ort::ConstValue& ort_value,
         .release();
   }
 
-  // Check if tensor is already on an IREE device.
+  // Check if tensor is already on our IREE device (both vendor_id and
+  // device_id must match).
   const OrtMemoryDevice* mem_device =
       ep_api.Value_GetMemoryDevice(ort_value.operator const OrtValue*());
   if (mem_device) {
     uint32_t vendor_id = ep_api.MemoryDevice_GetVendorId(mem_device);
+    uint32_t device_id = ep_api.MemoryDevice_GetDeviceId(mem_device);
     if (vendor_id == kEpVendorId) {
+      if (device_id != ep_device_id) {
+        return MakeCrossDeviceError("input", device_id, ep_device_id);
+      }
       // Tensor already on IREE device - wrap existing buffer without copy.
       ORT_CXX_LOGF_NOEXCEPT(logger, ORT_LOGGING_LEVEL_INFO,
                             "IREE EP: Input tensor already on device, "
@@ -263,18 +283,24 @@ OrtStatus* IreeBufferViewToOrtTensor(iree_hal_buffer_view_t* buffer_view,
                                      Ort::UnownedValue ort_value,
                                      iree_hal_device_t* device,
                                      const OrtEpApi& ep_api,
+                                     uint32_t ep_device_id,
                                      const Ort::Logger& logger) {
   // Get buffer from view.
   iree_hal_buffer_t* buffer = iree_hal_buffer_view_buffer(buffer_view);
   iree_device_size_t byte_length =
       iree_hal_buffer_view_byte_length(buffer_view);
 
-  // Check if output tensor is on an IREE device.
+  // Check if output tensor is on our IREE device (both vendor_id and
+  // device_id must match).
   const OrtMemoryDevice* mem_device =
       ep_api.Value_GetMemoryDevice(ort_value.operator OrtValue*());
   if (mem_device) {
     uint32_t vendor_id = ep_api.MemoryDevice_GetVendorId(mem_device);
+    uint32_t device_id = ep_api.MemoryDevice_GetDeviceId(mem_device);
     if (vendor_id == kEpVendorId) {
+      if (device_id != ep_device_id) {
+        return MakeCrossDeviceError("output", device_id, ep_device_id);
+      }
       // Output is on device - copy buffer directly (D2D).
       ORT_CXX_LOGF_NOEXCEPT(logger, ORT_LOGGING_LEVEL_INFO,
                             "IREE EP: Output tensor on device, performing D2D "

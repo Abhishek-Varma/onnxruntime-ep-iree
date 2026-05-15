@@ -269,14 +269,16 @@ class MlirGenerator {
   // All functions share the same module (and thus the same parameter
   // references), so when compiled to a single VMFB the weights are shared.
   // For the unspecialized case, pass a single variant with empty suffix/specs.
-  // Populates function_names with the MLIR function name for each variant.
+  // Populates function_names with the MLIR function name for each variant
+  // and output_bindings with one entry per graph output (in order).
   MaybeError Generate(const std::vector<VariantInfo>& variants,
-                      std::vector<std::string>& function_names) {
+                      std::vector<std::string>& function_names,
+                      std::vector<OutputBindingInfo>& output_bindings) {
     CollectMetadata();
     function_names.clear();
     function_names.reserve(variants.size());
 
-    ComputeOutputBindings();
+    output_bindings = ComputeOutputBindings();
     EmitModulePrologue();
     for (const auto& v : variants) {
       ConfigureForVariant(*v.specs, v.suffix);
@@ -361,27 +363,29 @@ class MlirGenerator {
   // Computes which outputs are tied to a caller-provided storage arg and the
   // storage arg's position in the function signature. Invariant across
   // variants, so call once after CollectMetadata() and before any variant
-  // emission.
+  // emission. Returns the per-output binding info for the caller; also
+  // populates storage_arg_indices_ which is read by EmitFunctionHeader and
+  // EmitReturn during emission.
   // TODO: Revisit once dynamic output shapes are supported.
-  void ComputeOutputBindings() {
-    output_bindings_.assign(graph_outputs_.size(), OutputBindingInfo{});
+  std::vector<OutputBindingInfo> ComputeOutputBindings() {
+    std::vector<OutputBindingInfo> bindings(graph_outputs_.size());
     storage_arg_indices_.assign(graph_outputs_.size(), kNoStorageArg);
     if (!enable_inplace_outputs_) {
-      // Disabled by session option: leave every binding marked
-      // is_tied=false so EmitFunctionHeader/EmitReturn fall back to the
-      // legacy out-of-place lowering and the runtime side stays on the
+      // Disabled by session option: leave every binding's shape as
+      // nullopt so EmitFunctionHeader/EmitReturn fall back to the legacy
+      // out-of-place lowering and the runtime side stays on the
       // post-execution copy path.
-      return;
+      return bindings;
     }
     size_t storage_arg_pos = graph_inputs_.size();
     for (size_t i = 0; i < graph_outputs_.size(); ++i) {
       const auto type_info = graph_outputs_[i].TypeInfo();
       if (!IsStaticShape(type_info)) continue;
       auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
-      output_bindings_[i].is_tied = true;
-      output_bindings_[i].shape = tensor_info.GetShape();
+      bindings[i].shape = tensor_info.GetShape();
       storage_arg_indices_[i] = storage_arg_pos++;
     }
+    return bindings;
   }
 
   // Configures the generator for a variant (dim specs, function name suffix).
@@ -1336,17 +1340,11 @@ class MlirGenerator {
   bool none_emitted_ = false;
 
   static constexpr size_t kNoStorageArg = static_cast<size_t>(-1);
-  std::vector<OutputBindingInfo> output_bindings_;
   // storage-arg index in the function's arg list, or kNoStorageArg if the
   // output is dynamic.
   std::vector<size_t> storage_arg_indices_;
   // Flag to emit the canonical in-place pattern.
   bool enable_inplace_outputs_ = false;
-
- public:
-  const std::vector<OutputBindingInfo>& GetOutputBindings() const {
-    return output_bindings_;
-  }
 };
 
 // Builds an IRPA parameter archive for large initializers.
@@ -1497,10 +1495,10 @@ MaybeError GenerateMlir(
     const Ort::ConstGraph& graph, const OrtApi& /*ort_api*/,
     const std::string& mlir_path, const std::string& irpa_path,
     const std::vector<std::pair<std::string, DimSpecVariant>>& variants,
+    TargetConfig target_config, bool enable_inplace_outputs,
     std::vector<std::string>& out_function_names, ParameterIndexPtr& out_index,
-    ParameterProviderPtr& out_provider, TargetConfig target_config,
-    std::vector<OutputBindingInfo>& out_output_bindings,
-    bool enable_inplace_outputs) {
+    ParameterProviderPtr& out_provider,
+    std::vector<OutputBindingInfo>& out_output_bindings) {
   std::ofstream file(mlir_path);
   if (!file.is_open()) {
     return error("Failed to open output file: {}", mlir_path);
@@ -1514,16 +1512,15 @@ MaybeError GenerateMlir(
   for (const auto& [suffix, specs] : variants) {
     infos.push_back({suffix, &specs});
   }
-  IREE_EP_RETURN_IF_ERROR(gen.Generate(infos, out_function_names));
+  IREE_EP_RETURN_IF_ERROR(
+      gen.Generate(infos, out_function_names, out_output_bindings));
 
   file.close();
   if (file.fail()) {
     return error("Failed to write to file: {}", mlir_path);
   }
 
-  IREE_EP_RETURN_IF_ERROR(gen.BuildParameterArchive(out_index, out_provider));
-  out_output_bindings = gen.GetOutputBindings();
-  return ok();
+  return gen.BuildParameterArchive(out_index, out_provider);
 }
 
 }  // namespace onnxruntime::iree

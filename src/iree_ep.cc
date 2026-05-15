@@ -270,11 +270,10 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
                         "IREE EP: Generating MLIR (%zu variants)",
                         mlir_variants.size());
   std::vector<OutputBindingInfo> output_bindings;
-  IREE_ORT_RETURN_IF_MAYBE_ERROR(
-      GenerateMlir(graph, ep->ort_api, mlir_file.Path(), irpa_file.Path(),
-                   mlir_variants, function_names, parameter_index,
-                   parameter_provider, std::move(target_config),
-                   output_bindings, ep->config_.enable_inplace_outputs));
+  IREE_ORT_RETURN_IF_MAYBE_ERROR(GenerateMlir(
+      graph, ep->ort_api, mlir_file.Path(), irpa_file.Path(), mlir_variants,
+      std::move(target_config), ep->config_.enable_inplace_outputs,
+      function_names, parameter_index, parameter_provider, output_bindings));
 
   // Phase 2: Compile MLIR to VMFB.
   std::vector<std::string> flags = GenerateCompileFlags(ep->config_);
@@ -511,7 +510,7 @@ OrtStatus* ORT_API_CALL IreeNodeComputeInfo::ComputeImpl(
     iree_hal_buffer_view_t* view = nullptr;
     ORT_RETURN_IF_ERROR(OrtTensorToIreeBufferView(
         input, device, allocator, iree_allocator_system(), &view,
-        info->ep.ep_api, info->ep.Logger()));
+        info->ep.ep_api, info->ep.DeviceId(), info->ep.Logger()));
     input_views.emplace_back(view);
   }
 
@@ -531,21 +530,24 @@ OrtStatus* ORT_API_CALL IreeNodeComputeInfo::ComputeImpl(
   // For each tied output (currently only static-shape outputs), pre-allocate
   // the ORT-side output and bind it as an extra IREE input AFTER the regular
   // inputs, in result-index order. We must always push a storage arg for every
-  // is_tied output so the wrapper's input arity matches what EmitFunctionHeader
-  // emitted. We retain the wrapping HalBufferViewPtr for each tied output so
-  // the runtime call's input list keeps a valid ref through invocation.
-  std::vector<HalBufferViewPtr> tied_output_views;
-  tied_output_views.reserve(info->output_bindings_.size());
+  // tied output so the wrapper's input arity matches what EmitFunctionHeader
+  // emitted. iree_runtime_call_inputs_push_back_buffer_view retains its own
+  // ref on each pushed view (via iree_vm_list_push_ref_retain), so the call's
+  // input list keeps the view alive across invoke on its own. Our local
+  // HalBufferViewPtr therefore exists only to drop the extra ref we hold
+  // after a successful push_back and to release the view if push_back itself
+  // errors out (in which case no retain happened and we still own the sole
+  // ref).
   std::vector<bool> bound_in_place(info->output_bindings_.size(), false);
   for (size_t i = 0; i < info->output_bindings_.size(); ++i) {
     const auto& binding = info->output_bindings_[i];
-    if (!binding.is_tied) continue;
+    if (!binding.shape.has_value()) continue;
 
     // ctx.GetOutput uses the static shape captured at MLIR-gen time. If the
     // user has IO-bound a pre-allocated output, this returns that buffer;
     // otherwise ORT allocates one for us.
     Ort::UnownedValue ort_out =
-        ctx.GetOutput(i, binding.shape.data(), binding.shape.size());
+        ctx.GetOutput(i, binding.shape->data(), binding.shape->size());
 
     // Vendor-id + device-id check decides whether the ORT tensor lives on
     // our IREE device:
@@ -574,7 +576,7 @@ OrtStatus* ORT_API_CALL IreeNodeComputeInfo::ComputeImpl(
       ORT_RETURN_IF_ERROR(OrtTensorToIreeBufferView(
           Ort::ConstValue{static_cast<const OrtValue*>(ort_out)}, device,
           allocator, iree_allocator_system(), &storage_view, info->ep.ep_api,
-          info->ep.Logger()));
+          info->ep.DeviceId(), info->ep.Logger()));
     } else {
       ORT_CXX_LOGF_NOEXCEPT(
           info->ep.Logger(), ORT_LOGGING_LEVEL_VERBOSE,
@@ -586,7 +588,7 @@ OrtStatus* ORT_API_CALL IreeNodeComputeInfo::ComputeImpl(
           Ort::ConstValue{static_cast<const OrtValue*>(ort_out)}, device,
           allocator, &storage_view));
     }
-    tied_output_views.emplace_back(storage_view);
+    HalBufferViewPtr storage_view_ptr(storage_view);
     IREE_ORT_RETURN_IF_ERROR(iree_runtime_call_inputs_push_back_buffer_view(
         call.Get(), storage_view));
     bound_in_place[i] = on_iree_device;
@@ -631,8 +633,9 @@ OrtStatus* ORT_API_CALL IreeNodeComputeInfo::ComputeImpl(
 
     // Allocate ORT output tensor and copy data from IREE buffer.
     Ort::UnownedValue output = ctx.GetOutput(i, shape.data(), shape.size());
-    ORT_RETURN_IF_ERROR(IreeBufferViewToOrtTensor(
-        output_view, output, device, info->ep.ep_api, info->ep.Logger()));
+    ORT_RETURN_IF_ERROR(
+        IreeBufferViewToOrtTensor(output_view, output, device, info->ep.ep_api,
+                                  info->ep.DeviceId(), info->ep.Logger()));
   }
   return nullptr;
 }

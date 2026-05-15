@@ -192,7 +192,7 @@ struct IreeNodeComputeInfo : OrtNodeComputeInfo {
   // Mappings from symbolic names to input tensor positions for dispatch.
   std::vector<SymbolicDimMapping> dim_mappings_;
   // Per-output binding info captured during MLIR generation.
-  std::vector<OutputBindingInfo> output_bindings_;
+  const std::vector<OutputBindingInfo> output_bindings_;
 
   // Runtime state (lazily initialized on first ComputeImpl call).
   RuntimeSessionPtr session_;
